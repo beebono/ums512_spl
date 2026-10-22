@@ -180,8 +180,29 @@ void cfw_el3_trap(uint64_t vector, uint64_t esr, uint64_t elr, uint64_t far,
 #define CFW_ANA_MODULE_EN0	(CFW_ANA_GLB + 0x0008)	/* ANA_REG_GLB_ARM_MODULE_EN */
 #define CFW_ANA_RTC_CLK_EN0	(CFW_ANA_GLB + 0x0010)	/* ANA_REG_GLB_RTC_CLK_EN */
 
+struct cfw_pin {
+	uint32_t reg;
+	uint32_t val;
+};
+
+#include "cfw_pinmap.h"
+
+#define CFW_PIN_BASE		0x32450000UL
+#define CFW_ADI_BASE		0x32120000
+
 static void cfw_board_init(void)
 {
+	unsigned int i;
+
+	/* pin_init(): the board pad mux/pull table. Linux only touches pads its
+	 * DT names, so i2c0-3, the amp and charger pads etc. rely on this. */
+	for (i = 0; i < ARRAY_SIZE(cfw_pinmap); i++)
+		REG32(CFW_PIN_BASE + (cfw_pinmap[i] >> 7) * 4) =
+			cfw_pinvals[cfw_pinmap[i] & 0x7f];
+	for (i = 0; i < ARRAY_SIZE(cfw_adie_pinmap); i++)
+		sci_adi_write(CFW_ADI_BASE + cfw_adie_pinmap[i].reg,
+			      cfw_adie_pinmap[i].val, 0);
+
 	/* sprd_gpio_init(): AP GPIO controller gate */
 	REG32(CFW_AON_APB_EB1) |= 1u << 1;		/* GPIO_EB */
 
