@@ -203,6 +203,10 @@ static void cfw_board_init(void)
 		sci_adi_write(CFW_ADI_BASE + cfw_adie_pinmap[i].reg,
 			      cfw_adie_pinmap[i].val, 0);
 
+	/* u-boot's dispc div_to_clk(): drop the DSI analog isolation
+	 * (ANALOG_MIPI_DSI_4LANE_DSI_ISO_SW, resets to 0x5). */
+	REG32(0x323a0034UL) = 0;
+
 	/* sprd_gpio_init(): AP GPIO controller gate */
 	REG32(CFW_AON_APB_EB1) |= 1u << 1;		/* GPIO_EB */
 
