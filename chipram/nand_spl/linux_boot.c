@@ -515,7 +515,7 @@ found:
 					(uint32_t)info.start + CFW_LOG_SECT + p / 512,
 					CFW_CHUNK_BLKS, (uint8_t *)(win + p)))
 			return;
-	CFW_BUZZ(5);	/* previous kernel log saved */
+	CFW_BUZZ(3);	/* previous kernel log saved */
 }
 
 void nand_boot(void)
@@ -534,10 +534,8 @@ void nand_boot(void)
 	dev = get_dev();
 	if (!dev)
 		cfw_fail(1);
-	CFW_BUZZ(2);	/* eMMC up (DDR init already gave 1) */
 
 	if (*(volatile uint64_t *)CFW_CANARY_ADDR == CFW_CANARY) {
-		CFW_BUZZ(6);	/* DRAM survived the reset */
 		cfw_probe_old_kernel(dev);
 		cfw_save_ramoops(dev);
 	}
@@ -580,7 +578,6 @@ void nand_boot(void)
 	    *(uint32_t *)fdt_hdr == CFW_TRAILER_MAGIC &&
 	    *(uint32_t *)(fdt_hdr + 4) < hdr->image_size)
 		file_len = *(uint32_t *)(fdt_hdr + 4);
-	CFW_BUZZ(3);	/* kernel + dtb loaded, jumping */
 
 	disable_ahb_ce_eb();
 	disable_ahb_ce_efs_eb();
@@ -600,7 +597,6 @@ void nand_boot(void)
 	cfw_gic_init();
 	cfw_install_el2_stub();
 	cfw_arm_probe(kernel, hdr->image_size, file_len);
-	CFW_BUZZ(4);	/* GIC up, entering the kernel */
 	spl_enter_linux_el2(kernel, CFW_DTB_ADDR);
 }
 
