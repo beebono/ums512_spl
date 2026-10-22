@@ -5,7 +5,7 @@ obj-y += ddr_boot.o
 else
 ifdef CONFIG_EMMC_BOOT
 ifneq ($(CONFIG_MMC_V40),)
-obj-y += emmc_boot.o mmc_v40.o part.o part_efi.o
+obj-y += emmc_boot.o mmc_v40.o part.o part_efi.o linux_boot.o linux_entry.o
 endif
 else
 ifdef CONFIG_UFS_BOOT

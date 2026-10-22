@@ -11,6 +11,10 @@ SECTIONS
 		*(.text*)
 	}
 
+	/* VBAR_EL3 table (cfw build): own section so its 2 KiB alignment
+	 * cannot push .text, and _start, off the BootROM entry address. */
+	.vectors ALIGN(2048) : { *(.vectors) }
+
 	. = ALIGN(8);
 	.rodata : { *(SORT_BY_ALIGNMENT(SORT_BY_NAME(.rodata*))) }
 

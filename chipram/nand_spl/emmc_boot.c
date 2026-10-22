@@ -688,6 +688,7 @@ static BOOLEAN spl_load_uboot_from_sd(void)
 }
 #endif
 
+#ifndef CONFIG_SPL_BOOT_LINUX	/* CFW path: linux_boot.c */
 void nand_boot(void)
 {
 	int ret;
@@ -1190,3 +1191,4 @@ if (!sysdump_mode)
 #endif
 #endif
 }
+#endif /* !CONFIG_SPL_BOOT_LINUX */
