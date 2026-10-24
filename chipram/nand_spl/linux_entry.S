@@ -1,15 +1,17 @@
 /*
  * EL3 -> EL2 handoff into an arm64 Linux Image (CFW boot path).
  *
- * x0 = kernel entry, x1 = dtb. The kernel gets x0 = dtb, x1..x3 = 0, MMU and
- * caches off (the SPL never enables them), EL2h with DAIF masked.
+ * x0 = kernel entry, x1 = dtb, x2/x3 = the EL3 monitor's VBAR_EL3/SP_EL3 to
+ * leave behind (x2 = 0: keep the SPL's vectors and stack). The kernel gets
+ * x0 = dtb, x1..x3 = 0, MMU and caches off (the SPL never enables them), EL2h
+ * with DAIF masked.
  */
 #include <config.h>
 #include <linux/linkage.h>
 
 #ifdef CONFIG_SPL_BOOT_LINUX
 
-/* Reserved spin-table page (ums512-rg-rotate-cfw.dts): EL2 vectors + stub at
+/* Reserved cfw-el2-page (ums512-rg-rotate-cfw.dts): EL2 vectors + stub at
  * the start, then the EL2 record; linux_boot.c keeps its canary above. */
 #define CFW_EL2_PAGE		0x80002000
 #define CFW_EL2_RECORD_OFF	0xe00
@@ -26,6 +28,8 @@
 ENTRY(spl_enter_linux_el2)
 	mov	x19, x0
 	mov	x20, x1
+	mov	x21, x2
+	mov	x22, x3
 
 	/* Catch faults in the setup below too (e.g. an UNDEFINED system register
 	 * on this SoC), not only after the eret. */
@@ -71,7 +75,12 @@ ENTRY(spl_enter_linux_el2)
 	msr	spsr_el3, x3
 	msr	elr_el3, x2
 
-	isb
+	/* From here on EL3 belongs to the monitor (PSCI); it forwards anything
+	 * else back to cfw_el3_vectors. */
+	cbz	x21, 1f
+	msr	vbar_el3, x21
+	mov	sp, x22
+1:	isb
 	eret				/* x19 = kernel, x20 = dtb carry over */
 ENDPROC(spl_enter_linux_el2)
 
@@ -85,6 +94,7 @@ ENDPROC(spl_enter_linux_el2)
 
 	.pushsection .vectors, "ax"
 	.align	11
+	.globl	cfw_el3_vectors
 cfw_el3_vectors:
 	cfw_vector 0
 	cfw_vector 1

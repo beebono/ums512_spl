@@ -7,7 +7,8 @@
  *
  * With no secure world, the SPL takes over the little EL3 setup Linux expects
  * from firmware (GICv3 groups/redistributor wake, ICC_SRE, SCR) and drops to
- * EL2. Only CPU0 runs; secondaries stay powered off.
+ * EL2 on CPU0. The secondaries are powered on later by the EL3 monitor
+ * (ext/boot/spl/monitor), which the SPL loads and leaves behind for PSCI.
  */
 #include <config.h>
 #include <common.h>
@@ -27,14 +28,17 @@ extern void spl_buzz(int count);
 #define CFW_BUZZ(n)	do { } while (0)
 #endif
 
-extern void spl_enter_linux_el2(unsigned long entry, unsigned long dtb);
+extern void spl_enter_linux_el2(unsigned long entry, unsigned long dtb,
+				unsigned long mon_vbar, unsigned long mon_sp);
+extern uint8_t cfw_el3_vectors[];
 extern void udelay(uint32 us);
 extern int read_common_partition(block_dev_desc_t *dev, uchar *partition_name,
 				 uint32_t offsetsector, uint32_t size, uint8_t *buf);
 
 #define CFW_PART		"boot"
 #define CFW_DTB_OFFSET		(48 << 20)
-/* mk_cfw_boot.py trailer in the sector before the dtb: "CFWS", Image length */
+/* mk_cfw_boot.py trailer in the sector before the dtb: "CFWS", Image length,
+ * monitor offset and length (0 = none) */
 #define CFW_TRAILER_OFFSET	(CFW_DTB_OFFSET - 512)
 #define CFW_TRAILER_MAGIC	0x53574643
 /* Where the SPL normally lands u-boot (0x9EFFFE00 + DHTB header): known-good
@@ -42,11 +46,22 @@ extern int read_common_partition(block_dev_desc_t *dev, uchar *partition_name,
  * sysdump-uboot here; the 96 MiB window stays below widevine's old base. */
 #define CFW_KERNEL_BASE		0x9f000000UL
 #define CFW_KERNEL_LIMIT	0xa5000000UL
-/* Between the low reservations (ddrbist/sysdumpinfo/spin-table, < 0x80003000)
+/* Between the low reservations (ddrbist/sysdumpinfo/cfw-el2-page, < 0x80003000)
  * and the SPL stack. */
 #define CFW_DTB_ADDR		0x80600000UL
 #define CFW_DTB_MAX		0x100000UL
 #define CFW_CHUNK_BLKS		2048	/* 1 MiB per CMD18, the size u-boot loads used */
+
+/* EL3 monitor (monitor/monitor.h): loaded here, reserved no-map in the dts.
+ * The status page at +0xf000 is past CFW_MON_MAX. */
+#define CFW_MON_BASE		0x80100000UL
+#define CFW_MON_MAX		0xf000
+#define CFW_MON_MAGIC		0x4d574643	/* "CFWM" */
+
+struct cfw_mon_hdr {
+	uint32_t branch, magic, version, size;
+	uint64_t init, vectors, stack0;
+};
 
 #define ARM64_IMAGE_MAGIC	0x644d5241	/* "ARM\x64" */
 #define FDT_MAGIC		0xd00dfeed
@@ -342,7 +357,7 @@ static void cfw_gic_init(void)
  * uboot_log: a cfw_log_record in sector 1, the raw RAM from sector 8.
  */
 /*
- * Progress probe in the reserved spin-table page, for a reset that keeps
+ * Progress probe in the reserved cfw-el2-page, for a reset that keeps
  * DRAM. Before the jump the SPL records where the kernel is and fills the
  * part of image_size past the Image file (BSS, then the early page tables)
  * with CFW_FILL. On the next boot, the 16 KiB chunks the old kernel wrote are
@@ -364,7 +379,7 @@ struct cfw_probe_record {
 };
 
 /* Page layout (linux_entry.S): EL2 stub at 0x000, EL2 record at 0xe00,
- * canary at 0xf00, spin-table release address at 0xff8. */
+ * canary at 0xf00. */
 #define CFW_EL2_PAGE		0x80002000UL
 #define CFW_EL2_RECORD		(CFW_EL2_PAGE + 0xe00)
 #define CFW_CANARY_ADDR		(CFW_EL2_PAGE + 0xf00)
@@ -460,6 +475,18 @@ static void cfw_install_el2_stub(void)
 		*(volatile uint32_t *)(CFW_EL2_PAGE + i) = *(uint32_t *)(cfw_el2_blob + i);
 }
 
+/* Load the monitor the trailer names; NULL if there is none or it is bad. */
+static struct cfw_mon_hdr *cfw_load_monitor(block_dev_desc_t *dev,
+					    uint32_t off, uint32_t len)
+{
+	struct cfw_mon_hdr *h = (struct cfw_mon_hdr *)CFW_MON_BASE;
+
+	if (!off || !len || len > CFW_MON_MAX ||
+	    cfw_read(dev, off, len, (uint8_t *)h) || h->magic != CFW_MON_MAGIC)
+		return NULL;
+	return h;
+}
+
 #define CFW_LOG_NEEDLE		"Booting Linux on physical CPU 0x00"
 #define CFW_LOG_LEAD		0x10000		/* bytes kept before the match */
 #define CFW_LOG_LEN		0x100000
@@ -531,10 +558,11 @@ found:
 void nand_boot(void)
 {
 	struct arm64_image_header *hdr;
+	struct cfw_mon_hdr *mon = NULL;
 	block_dev_desc_t *dev;
-	unsigned long kernel;
+	unsigned long kernel, mon_vbar = 0, mon_sp = 0;
 	uint8_t fdt_hdr[512];
-	uint32_t dtb_size, file_len;
+	uint32_t dtb_size, file_len, *trailer = (uint32_t *)fdt_hdr;
 
 	sprd_firewall_usb_clk_enable();
 
@@ -581,13 +609,15 @@ void nand_boot(void)
 	    cfw_read(dev, CFW_DTB_OFFSET, dtb_size, (uint8_t *)CFW_DTB_ADDR))
 		cfw_fail(6);
 
-	/* Image file length, for the progress probe; without the trailer the
-	 * probe region is empty. */
+	/* Image file length, for the progress probe (without the trailer the
+	 * probe region is empty), and the monitor. */
 	file_len = (uint32_t)hdr->image_size;
 	if (!cfw_read(dev, CFW_TRAILER_OFFSET, sizeof(fdt_hdr), fdt_hdr) &&
-	    *(uint32_t *)fdt_hdr == CFW_TRAILER_MAGIC &&
-	    *(uint32_t *)(fdt_hdr + 4) < hdr->image_size)
-		file_len = *(uint32_t *)(fdt_hdr + 4);
+	    trailer[0] == CFW_TRAILER_MAGIC) {
+		if (trailer[1] < hdr->image_size)
+			file_len = trailer[1];
+		mon = cfw_load_monitor(dev, trailer[2], trailer[3]);
+	}
 
 	disable_ahb_ce_eb();
 	disable_ahb_ce_efs_eb();
@@ -607,7 +637,14 @@ void nand_boot(void)
 	cfw_gic_init();
 	cfw_install_el2_stub();
 	cfw_arm_probe(kernel, hdr->image_size, file_len);
-	spl_enter_linux_el2(kernel, CFW_DTB_ADDR);
+
+	/* Without a monitor Linux has no PSCI: a psci node in the dtb then
+	 * traps into cfw_el3_trap (8 + 9 pulses). */
+	if (mon && !((int (*)(unsigned long))mon->init)((unsigned long)cfw_el3_vectors)) {
+		mon_vbar = mon->vectors;
+		mon_sp = mon->stack0;
+	}
+	spl_enter_linux_el2(kernel, CFW_DTB_ADDR, mon_vbar, mon_sp);
 }
 
 #endif /* CONFIG_SPL_BOOT_LINUX */
