@@ -161,8 +161,10 @@ void cfw_el3_trap(uint64_t vector, uint64_t esr, uint64_t elr, uint64_t far,
 	if (TRUE == Emmc_Init()) {
 		spl_set_boot_dev(NULL);
 		dev = get_dev();
+#ifdef CONFIG_SPL_EMMC_TRACE
 		if (dev && !get_partition_info_by_name(dev, (uchar *)"uboot_log", &info))
 			Emmc_Write(PARTITION_USER, (uint32_t)info.start, 1, sect);
+#endif
 	}
 	cfw_fail(9);
 }
@@ -243,8 +245,10 @@ static void cfw_dump_fw(block_dev_desc_t *dev)
 		buf[i] = REG32(CFW_PUB_FW_BASE + i * 4);
 	for (i = 0; i < 256; i++)
 		buf[128 + i] = REG32(CFW_PUB_FW_SEG(0) + i * 4);
+#ifdef CONFIG_SPL_EMMC_TRACE
 	if (!get_partition_info_by_name(dev, (uchar *)"uboot_log", &info))
 		Emmc_Write(PARTITION_USER, (uint32_t)info.start + 4, 3, (uint8_t *)buf);
+#endif
 }
 
 /* Segment 0 = all of DRAM, every master, secure and non-secure; 1..6 off.
@@ -394,12 +398,14 @@ static void cfw_probe_old_kernel(block_dev_desc_t *dev)
 	}
 	r->chunks = n;
 
+#ifdef CONFIG_SPL_EMMC_TRACE
 	if (!get_partition_info_by_name(dev, (uchar *)"uboot_log", &info)) {
 		Emmc_Write(PARTITION_USER, (uint32_t)info.start + 2, 1, sect);
 		/* EL2 stub record, verbatim (sector 3) */
 		Emmc_Write(PARTITION_USER, (uint32_t)info.start + 3, 1,
 			   (uint8_t *)CFW_EL2_RECORD);
 	}
+#endif
 }
 
 /* ramoops (ums512-rg-rotate.dts: 0xfff80000, 256 KiB) keeps a complete console
@@ -413,6 +419,7 @@ static void cfw_save_ramoops(block_dev_desc_t *dev)
 	disk_partition_t info;
 	unsigned long p;
 
+#ifdef CONFIG_SPL_EMMC_TRACE
 	if (get_partition_info_by_name(dev, (uchar *)"uboot_log", &info))
 		return;
 	for (p = 0; p < CFW_RAMOOPS_SIZE; p += CFW_CHUNK_BLKS * 512)
@@ -420,6 +427,7 @@ static void cfw_save_ramoops(block_dev_desc_t *dev)
 					(uint32_t)info.start + CFW_RAMOOPS_SECT + p / 512,
 					CFW_CHUNK_BLKS, (uint8_t *)(CFW_RAMOOPS_ADDR + p)))
 			return;
+#endif
 }
 
 static void cfw_arm_probe(unsigned long kernel, uint64_t image_size,
@@ -500,6 +508,7 @@ static void cfw_save_old_log(block_dev_desc_t *dev)
 	return;
 
 found:
+#ifdef CONFIG_SPL_EMMC_TRACE
 	win = (p - CFW_LOG_LEAD > base ? p - CFW_LOG_LEAD : base) & ~0x1ffUL;
 	if (get_partition_info_by_name(dev, (uchar *)"uboot_log", &info))
 		return;
@@ -516,6 +525,7 @@ found:
 					CFW_CHUNK_BLKS, (uint8_t *)(win + p)))
 			return;
 	CFW_BUZZ(3);	/* previous kernel log saved */
+#endif
 }
 
 void nand_boot(void)
