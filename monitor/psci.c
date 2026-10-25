@@ -13,6 +13,7 @@
  */
 #include "monitor.h"
 #include "pmu_seq.h"
+#include "csp_ops.h"
 
 #define REG32(a)		(*(volatile uint32_t *)(uintptr_t)(a))
 #define REG64(a)		(*(volatile uint64_t *)(uintptr_t)(a))
@@ -119,6 +120,8 @@ static struct mon_status status_prev __attribute__((section(".status_prev")));
 /* what each pmu_seq register held before mon_init overwrote it (reset or
  * SPL value), in table order, for devmem at MON_BASE + 0xf400 */
 static uint32_t pmu_seq_before[64] __attribute__((section(".status_seq")));
+/* likewise for csp_ops, at MON_BASE + 0xf500 */
+static uint32_t csp_before[96] __attribute__((section(".status_csp")));
 
 static inline void dsb(void)
 {
@@ -584,6 +587,17 @@ int mon_init(uint64_t spl_vbar)
 		    pmu_seq[i].reg == PMU_BASE + 0x374)
 			continue;
 		*r = pmu_seq[i].val;
+	}
+	dsb();
+
+	/* and the rest of u-boot's CSP_Init, in its order */
+	for (i = 0; i < sizeof(csp_ops) / sizeof(csp_ops[0]); i++) {
+		volatile uint32_t *r = (volatile uint32_t *)(uintptr_t)csp_ops[i].reg;
+		uint32_t v = *r;
+
+		if (i < 96)
+			((volatile uint32_t *)csp_before)[i] = v;
+		*r = (v & csp_ops[i].and_mask) | csp_ops[i].or_mask;
 	}
 	dsb();
 

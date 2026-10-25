@@ -28,6 +28,7 @@ SECTIONS
 
 	.status MON_BASE + 0xf000 (NOLOAD) : { *(.status) }
 	.status_seq MON_BASE + 0xf400 (NOLOAD) : { *(.status_seq) }
+	.status_csp MON_BASE + 0xf500 (NOLOAD) : { *(.status_csp) }
 	ASSERT(. <= MON_BASE + 0x10000, "status page past the reservation")
 
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
