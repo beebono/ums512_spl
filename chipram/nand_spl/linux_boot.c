@@ -20,12 +20,13 @@
 #include <adi.h>
 
 #ifdef CONFIG_SPL_BOOT_LINUX
-
-#ifdef CONFIG_SPL_VIBRATE_MARKERS
+#if defined(CONFIG_SPL_VIBRATE_MARKERS) || defined(CONFIG_SPL_VIBRATE_BOOT)
 extern void spl_buzz(int count);
+#ifdef CONFIG_SPL_VIBRATE_MARKERS
 #define CFW_BUZZ(n)	spl_buzz(n)
 #else
 #define CFW_BUZZ(n)	do { } while (0)
+#endif
 #endif
 
 extern void spl_enter_linux_el2(unsigned long entry, unsigned long dtb,
@@ -563,6 +564,10 @@ void nand_boot(void)
 	unsigned long kernel, mon_vbar = 0, mon_sp = 0;
 	uint8_t fdt_hdr[512];
 	uint32_t dtb_size, file_len, *trailer = (uint32_t *)fdt_hdr;
+
+#ifdef CONFIG_SPL_VIBRATE_BOOT
+	spl_buzz(1);
+#endif
 
 	sprd_firewall_usb_clk_enable();
 

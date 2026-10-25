@@ -651,7 +651,7 @@ void enable_auto_gate_for_lp(void)
 	spl_ana_clk_config(300000);
 }
 
-#ifdef CONFIG_SPL_VIBRATE_MARKERS
+#if defined(CONFIG_SPL_VIBRATE_MARKERS) || defined(CONFIG_SPL_VIBRATE_BOOT)
 /*
  * Progress markers via the sc2730 vibrator motor.
  *
