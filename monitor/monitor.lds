@@ -22,9 +22,12 @@ SECTIONS
 		. = ALIGN(16);
 		__bss_end = .;
 	}
-	ASSERT(. <= MON_BASE + 0xf000, "monitor overlaps its status page")
+	ASSERT(. <= MON_BASE + 0xe000, "monitor overlaps the previous status page")
+
+	.status_prev MON_BASE + 0xe000 (NOLOAD) : { *(.status_prev) }
 
 	.status MON_BASE + 0xf000 (NOLOAD) : { *(.status) }
+	.status_seq MON_BASE + 0xf400 (NOLOAD) : { *(.status_seq) }
 	ASSERT(. <= MON_BASE + 0x10000, "status page past the reservation")
 
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }

@@ -68,6 +68,48 @@ mon_enter_ns:
 	isb
 	eret
 
+/*
+ * mon_flush_private_dcache: clean and invalidate the core's own data
+ * caches (L1 and L2, cache levels 1-2) by set/way, before it powers down.
+ * The DSU's L3 is shared and stays powered, so it is left alone. Runs at
+ * EL3 with the MMU off, so nothing here allocates new lines.
+ * Clobbers x0-x11.
+ */
+	.globl	mon_flush_private_dcache
+mon_flush_private_dcache:
+	mrs	x0, clidr_el1
+	mov	x10, xzr			/* level << 1 */
+1:	add	x2, x10, x10, lsr #1		/* level * 3 */
+	lsr	x1, x0, x2
+	and	x1, x1, #7			/* Ctype for this level */
+	cmp	x1, #2
+	b.lo	4f				/* no data or unified cache */
+	msr	csselr_el1, x10
+	isb
+	mrs	x1, ccsidr_el1
+	and	x2, x1, #7
+	add	x2, x2, #4			/* log2(line bytes) */
+	ubfx	x4, x1, #3, #10			/* ways - 1 */
+	clz	w5, w4				/* way shift */
+	ubfx	x7, x1, #13, #15		/* sets - 1 */
+2:	mov	x9, x4				/* way */
+3:	lsl	x6, x9, x5
+	orr	x11, x10, x6
+	lsl	x6, x7, x2
+	orr	x11, x11, x6
+	dc	cisw, x11
+	subs	x9, x9, #1
+	b.ge	3b
+	subs	x7, x7, #1
+	b.ge	2b
+4:	add	x10, x10, #2
+	cmp	x10, #4				/* levels 1 and 2 only */
+	b.lo	1b
+	msr	csselr_el1, xzr
+	dsb	sy
+	isb
+	ret
+
 /* Forward an exception to the same slot of the SPL's EL3 vectors, which
  * record it in uboot_log (or handle the EL2 stub's smc #1 checkpoint).
  * Clobbers x9, as the SPL's own entry clobbers x9..x11. */

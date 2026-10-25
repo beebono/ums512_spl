@@ -18,6 +18,7 @@
 #define MON_BASE		0x80100000
 #define MON_SIZE		0x10000
 #define MON_STATUS_OFF		0xf000		/* status page, for devmem */
+#define MON_PREV_OFF		0xe000		/* the previous boot's status page, if DRAM kept it */
 
 #define MON_MAGIC		0x4d574643	/* "CFWM" */
 #define MON_VERSION		1
@@ -44,9 +45,10 @@ struct mon_hdr {
 
 enum { MON_OFF, MON_ON_PENDING, MON_ON };
 
-#define MON_F_PARKED		(1u << 0)	/* in CPU_OFF's park loop, still powered */
+#define MON_F_PD_TIMEOUT	(1u << 0)	/* CPU_OFF: the PMU never reported the core ready to power down */
 #define MON_F_GIC_TIMEOUT	(1u << 1)	/* redistributor power-up or wake timed out */
 #define MON_F_GIC_NOMATCH	(1u << 2)	/* no GICR frame matched; used frame == core */
+#define MON_F_PARKED		(1u << 3)	/* woke with no CPU_ON: parked at EL3, powered */
 
 /* Status page at MON_BASE + MON_STATUS_OFF: header, then cpu[n] at 0x40 * (n + 1). */
 struct mon_cpu {
@@ -58,14 +60,40 @@ struct mon_cpu {
 	int32_t on_ret;		/* last CPU_ON result */
 	uint64_t entry;		/* CPU_ON entry point and context id */
 	uint64_t context;
-	uint64_t pad[3];
+	uint32_t off_calls;	/* CPU_OFF calls on this core */
+	uint32_t pd_seen;	/* PMU power-down status byte when CPU_OFF went to WFI */
+	uint32_t pd_wait_max;	/* longest wait for that byte, in 26 MHz ticks */
+	uint32_t pd_timeouts;	/* waits that gave up (MON_F_PD_TIMEOUT) */
+	uint32_t off_step;	/* how far the last CPU_OFF got (MON_OFF_STEP_*) */
+	uint32_t wfi_wakes;	/* times CPU_OFF's final WFI returned */
+};
+
+enum {
+	MON_OFF_STEP_ENTERED = 1,
+	MON_OFF_STEP_GIC_OFF,
+	MON_OFF_STEP_FLUSHED,
+	MON_OFF_STEP_PMU_ARMED,
+	MON_OFF_STEP_POLLED,
+	MON_OFF_STEP_WFI,
 };
 
 struct mon_status {
 	uint64_t magic;		/* "CFWMON01" once mon_init() ran */
 	uint32_t smc_calls;	/* PSCI calls seen */
 	uint32_t last_fid;
-	uint64_t pad[6];
+	/* a core that came out of reset with no CPU_ON for it, and went
+	 * straight back down: how often, the last one, and its GIC pending
+	 * SGIs/PPIs (GICR_ISPENDR0) as it woke */
+	uint32_t spurious_wakes;
+	uint32_t spurious_core;
+	uint32_t spurious_pend;
+	uint32_t spurious_cpu_on;	/* CPU_ON calls that found such a core already up */
+	uint32_t spurious_mode;		/* its APCU_MODE_STATE byte as it woke */
+	uint32_t spurious_wake_en;	/* APCPU_CORE_WAKEUP_EN then */
+	/* per core, (PSCI function id & 0xff) + 1 while it is inside an
+	 * SMC, 0 otherwise: a core stuck at EL3 shows here */
+	uint8_t in_smc[MON_NCPUS];
+	uint64_t pad[2];
 	struct mon_cpu cpu[MON_NCPUS];
 };
 
@@ -73,6 +101,7 @@ _Static_assert(sizeof(struct mon_cpu) == 0x40, "status page layout");
 _Static_assert(sizeof(struct mon_status) == 0x40 * (MON_NCPUS + 1), "status page layout");
 
 void mon_enter_ns(uint64_t entry, uint64_t context) __attribute__((noreturn));
+void mon_flush_private_dcache(void);
 #endif
 
 #endif /* CFW_MONITOR_H */

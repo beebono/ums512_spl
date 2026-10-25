@@ -19,7 +19,7 @@ SRCS := entry.S psci.c
 $(O)/monitor.bin: $(O)/monitor.elf
 	$(OBJCOPY) -O binary $< $@
 
-$(O)/monitor.elf: $(SRCS) monitor.h monitor.lds
+$(O)/monitor.elf: $(SRCS) monitor.h pmu_seq.h monitor.lds
 	@mkdir -p $(O)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(SRCS)
 
