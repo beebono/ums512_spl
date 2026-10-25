@@ -2,11 +2,13 @@
  * cfw EL3 monitor: PSCI 1.0 subset and the ums512 core power sequence.
  *
  * Implemented: PSCI_VERSION, PSCI_FEATURES, CPU_ON, AFFINITY_INFO,
- * MIGRATE_INFO_TYPE and CPU_OFF. CPU_OFF powers the core down through the
- * PMU; CPU_ON powers it up again and it comes back through its reset vector
- * (mon_warm_entry). Everything else returns NOT_SUPPORTED: SYSTEM_RESET/OFF
- * then fall through to the sc27xx handlers, and with no CPU_SUSPEND
- * cpuidle-psci stays out.
+ * MIGRATE_INFO_TYPE, CPU_OFF and CPU_SUSPEND (standby, and core power-down).
+ * CPU_OFF powers the core down through the PMU; CPU_ON powers it up again
+ * and it comes back through its reset vector (mon_warm_entry). A power-down
+ * CPU_SUSPEND is the same sequence with the core's wake-up enable set: an
+ * interrupt for it powers it back up, and it resumes at the entry point
+ * Linux gave. Everything else returns NOT_SUPPORTED: SYSTEM_RESET/OFF then
+ * fall through to the sc27xx handlers.
  *
  * The register sequences are those of the stock SML (Unisoc TF-A v1.4,
  * plat_sprd_psci_pm_ops), decoded from the v1.44 PAC.
@@ -89,6 +91,12 @@ static const uint8_t pd_status_shift[MON_NCPUS] = {
 #define PSCI_AFFINITY_INFO_64	0xc4000004
 #define PSCI_MIGRATE_INFO_TYPE	0x84000006
 #define PSCI_FEATURES		0x8400000a
+#define PSCI_CPU_SUSPEND_32	0x84000001
+#define PSCI_CPU_SUSPEND_64	0xc4000001
+
+/* power_state, original format: StateID [15:0], type [16], level [25:24] */
+#define PSTATE_TYPE_PWRDN	(1u << 16)
+#define PSTATE_LEVEL(p)		(((p) >> 24) & 3)
 
 #define PSCI_SUCCESS		0
 #define PSCI_NOT_SUPPORTED	-1
@@ -120,6 +128,8 @@ static struct mon_status status_prev __attribute__((section(".status_prev")));
 /* what each pmu_seq register held before mon_init overwrote it (reset or
  * SPL value), in table order, for devmem at MON_BASE + 0xf400 */
 static uint32_t pmu_seq_before[64] __attribute__((section(".status_seq")));
+static struct mon_susp susp_stats __attribute__((section(".status_susp")));
+static volatile struct mon_susp *const ss = &susp_stats;
 /* likewise for csp_ops, at MON_BASE + 0xf500 */
 static uint32_t csp_before[96] __attribute__((section(".status_csp")));
 
@@ -347,6 +357,8 @@ static void __attribute__((noreturn)) core_off_wfi(unsigned int core)
 	}
 }
 
+static void __attribute__((noreturn)) mon_resume(unsigned int core);
+
 /* First C on a secondary after reset (entry.S), on its own EL3 stack. */
 void __attribute__((noreturn)) mon_warm(unsigned int core)
 {
@@ -356,14 +368,17 @@ void __attribute__((noreturn)) mon_warm(unsigned int core)
 	dsb();
 	el3_setup();
 
+	if (c->state == MON_SUSPENDED)
+		ss->resumed[core]++;
+
 	/*
-	 * Powered up without a CPU_ON for it: the PMU woke an off core, for
-	 * reasons not yet known (nothing pending in its SGIs/PPIs). It must
-	 * not run the last CPU_ON's entry point again. Powering it straight
-	 * back down left it unable to power up on the next CPU_ON, so it
-	 * parks here instead, powered, and CPU_ON releases it.
+	 * Powered up with neither a CPU_ON nor a suspend for it: the PMU woke
+	 * an off core (seen before the PMU power sequencing was applied). It
+	 * must not run the last CPU_ON's entry point again. Powering it
+	 * straight back down left it unable to power up on the next CPU_ON,
+	 * so it parks here instead, powered, and CPU_ON releases it.
 	 */
-	if (c->state != MON_ON_PENDING) {
+	if (c->state != MON_ON_PENDING && c->state != MON_SUSPENDED) {
 		uint32_t f = 0;
 
 		st->spurious_wakes++;
@@ -380,7 +395,21 @@ void __attribute__((noreturn)) mon_warm(unsigned int core)
 		c->flags &= ~MON_F_PARKED;
 		dsb();
 	}
+	mon_resume(core);
+}
 
+/*
+ * Into Linux at this core's entry point with the core as a fresh CPU_ON
+ * would leave it: after a CPU_ON, a power-down suspend (both through the
+ * reset vector) or a suspend whose WFI returned with the power still on.
+ */
+static void __attribute__((noreturn)) mon_resume(unsigned int core)
+{
+	volatile struct mon_cpu *c = &st->cpu[core];
+
+	/* the power-down set the core's interrupt disable; a power cycle
+	 * clears it, a WFI that returned early doesn't */
+	REG32(PMU_CLR(pd_misc[core])) = 1;
 	/* CPU_ON's own writes, for a core that took a CPU_ON while bouncing
 	 * off a spurious wake (and so skipped them), then stock on_finish:
 	 * auto shutdown stays armed; no WFI retention (see above) */
@@ -391,6 +420,8 @@ void __attribute__((noreturn)) mon_warm(unsigned int core)
 	c->flags |= gic_redist_init(core);
 	el2_reset();
 	c->state = MON_ON;
+	/* a suspend never returns through mon_smc: its marker ends here */
+	st->in_smc[core] = 0;
 	dsb();
 	mon_enter_ns(c->entry, c->context);
 }
@@ -405,7 +436,7 @@ static int64_t psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
 		return PSCI_INVALID_PARAMS;
 	c = &st->cpu[core];
 	c->on_calls++;
-	if (c->state == MON_ON)
+	if (c->state == MON_ON || c->state == MON_SUSPENDED)
 		return c->on_ret = PSCI_ALREADY_ON;
 	if (c->state == MON_ON_PENDING)
 		return c->on_ret = PSCI_ON_PENDING;
@@ -462,6 +493,43 @@ static void __attribute__((noreturn)) psci_cpu_off(void)
 	core_off_wfi(core);
 }
 
+/*
+ * CPU_SUSPEND. Standby is a WFI. A core power-down (level 0) runs the
+ * CPU_OFF sequence with the wake-up enable set; an interrupt for the core
+ * powers it back up through the reset vector into mon_warm. If the WFI
+ * returns with the power still on (something was already pending), resume
+ * the same way, so Linux sees one path. Cluster and system levels are
+ * stage 3.
+ */
+static int64_t psci_cpu_suspend(uint32_t pstate, uint64_t entry, uint64_t context)
+{
+	unsigned int core = my_core();
+	volatile struct mon_cpu *c = &st->cpu[core];
+
+	if (!(pstate & PSTATE_TYPE_PWRDN)) {
+		ss->standby[core]++;
+		dsb();
+		asm volatile("wfi");
+		return PSCI_SUCCESS;
+	}
+	if (PSTATE_LEVEL(pstate) != 0)
+		return PSCI_INVALID_PARAMS;
+
+	ss->calls[core]++;
+	c->entry = entry;
+	c->context = context;
+	REG32(AON_SEC_RVBARADDR(core)) = (uint32_t)(MON_BASE >> 2);
+	c->state = MON_SUSPENDED;
+	dsb();
+	core_power_down(core, 1);
+	asm volatile("wfi");
+
+	ss->early[core]++;
+	dsb();
+	el3_setup();
+	mon_resume(core);
+}
+
 static int64_t psci_affinity_info(uint64_t target, uint64_t level)
 {
 	int core = target_core(target);
@@ -470,6 +538,7 @@ static int64_t psci_affinity_info(uint64_t target, uint64_t level)
 		return PSCI_INVALID_PARAMS;
 	switch (st->cpu[core].state) {
 	case MON_ON:
+	case MON_SUSPENDED:
 		return 0;
 	case MON_ON_PENDING:
 		return 2;
@@ -494,6 +563,9 @@ static int64_t psci_features(uint32_t fid)
 	case PSCI_MIGRATE_INFO_TYPE:
 	case PSCI_FEATURES:
 		return PSCI_SUCCESS;
+	case PSCI_CPU_SUSPEND_32:
+	case PSCI_CPU_SUSPEND_64:
+		return 0;	/* original power_state format, platform coordinated */
 	default:
 		return PSCI_NOT_SUPPORTED;
 	}
@@ -527,6 +599,12 @@ void mon_smc(struct mon_regs *r)
 		break;
 	case PSCI_AFFINITY_INFO_64:
 		ret = psci_affinity_info(r->x[1], r->x[2]);
+		break;
+	case PSCI_CPU_SUSPEND_32:
+		ret = psci_cpu_suspend((uint32_t)r->x[1], (uint32_t)r->x[2], (uint32_t)r->x[3]);
+		break;
+	case PSCI_CPU_SUSPEND_64:
+		ret = psci_cpu_suspend((uint32_t)r->x[1], r->x[2], r->x[3]);
 		break;
 	case PSCI_CPU_OFF:
 		psci_cpu_off();
@@ -604,6 +682,13 @@ int mon_init(uint64_t spl_vbar)
 	/* The SPL leaves CPU0 at 0x1800000 (spl_start.S); every core must
 	 * agree, and stock uses 26 MHz. */
 	asm volatile("msr cntfrq_el0, %0" :: "r" ((uint64_t)MON_CNTFRQ));
+
+	/* every core's reset vector here, core 0 included: CPU_ON only sets
+	 * the ones it starts, and core 0 can now power down in idle */
+	for (i = 0; i < MON_NCPUS; i++)
+		REG32(AON_SEC_RVBARADDR(i)) = (uint32_t)(MON_BASE >> 2);
+	for (p = (volatile uint64_t *)ss; p < (volatile uint64_t *)(ss + 1); p++)
+		*p = 0;
 
 	for (i = 0; i < MON_NCPUS; i++)
 		REG32(PMU_CLR(pd_cfg[i])) = PD_DBG_SHUTDOWN_EN;

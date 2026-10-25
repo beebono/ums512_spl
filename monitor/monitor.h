@@ -43,7 +43,7 @@ struct mon_hdr {
 	uint64_t stack0;	/* SP_EL3 for the handoff (CPU0's stack top) */
 };
 
-enum { MON_OFF, MON_ON_PENDING, MON_ON };
+enum { MON_OFF, MON_ON_PENDING, MON_ON, MON_SUSPENDED };
 
 #define MON_F_PD_TIMEOUT	(1u << 0)	/* CPU_OFF: the PMU never reported the core ready to power down */
 #define MON_F_GIC_TIMEOUT	(1u << 1)	/* redistributor power-up or wake timed out */
@@ -99,6 +99,14 @@ struct mon_status {
 
 _Static_assert(sizeof(struct mon_cpu) == 0x40, "status page layout");
 _Static_assert(sizeof(struct mon_status) == 0x40 * (MON_NCPUS + 1), "status page layout");
+
+/* CPU_SUSPEND counters, per core, at MON_BASE + 0xf300 */
+struct mon_susp {
+	uint32_t calls[MON_NCPUS];	/* power-down CPU_SUSPEND calls */
+	uint32_t early[MON_NCPUS];	/* of those, WFI returned with the power on */
+	uint32_t standby[MON_NCPUS];	/* standby (WFI only) calls */
+	uint32_t resumed[MON_NCPUS];	/* came back through the reset vector */
+};
 
 void mon_enter_ns(uint64_t entry, uint64_t context) __attribute__((noreturn));
 void mon_flush_private_dcache(void);
