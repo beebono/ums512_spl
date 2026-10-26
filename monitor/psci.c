@@ -19,6 +19,7 @@
 #include "monitor.h"
 #include "pmu_seq.h"
 #include "csp_ops.h"
+#include "pmic_seq.h"
 
 #define REG32(a)		(*(volatile uint32_t *)(uintptr_t)(a))
 #define REG64(a)		(*(volatile uint64_t *)(uintptr_t)(a))
@@ -133,6 +134,29 @@ static const uint32_t ap_sys_regs[] = {
 #define AP_SYS_AP_AHB_EB	0	/* index of 0x20100000 */
 #define AP_SYS_AP_APB_EB	54	/* index of 0x71000000 */
 static uint32_t ap_sys_saved[N_AP_SYS_REGS];
+
+/*
+ * The ADI bus to the SC2730 PMIC, 15-bit address mode (as the SPL sets it
+ * up): a write is a store into the slave window once the FIFO has room; a
+ * read posts the address and polls for the data, whose top half echoes the
+ * address >> 2.
+ */
+#define ADI_BASE		0x32100000UL
+#define ADI_RD_CMD		(ADI_BASE + 0x28)
+#define ADI_RD_DATA		(ADI_BASE + 0x2c)
+#define ADI_RD_BUSY		(1u << 31)
+#define ADI_FIFO_STS		(ADI_BASE + 0x30)
+#define ADI_FIFO_FULL		(1u << 11)
+#define ADI_FIFO_EMPTY		(1u << 10)
+#define ADI_SLAVE		0x32120000UL
+
+/* the PMIC registers u-boot's pmic_lowpower_config() set, as mon_init found
+ * them, at MON_BASE + 0xf800 */
+static struct {
+	uint32_t chip_id;	/* SC2730 CHIP_ID_LOW */
+	uint32_t errors;	/* ADI timeouts or read-back mismatches */
+	uint16_t before[64];
+} pmic_status __attribute__((section(".status_pmic")));
 
 /* GICv3 distributor, secure view */
 #define GICD_BASE		0x12000000UL
@@ -1101,6 +1125,74 @@ void mon_smc(struct mon_regs *r)
 	dsb();
 }
 
+static int adi_read(uint32_t off)
+{
+	unsigned long a = ADI_SLAVE + off;
+	uint64_t t0 = ticks();
+	uint32_t v;
+
+	REG32(ADI_RD_CMD) = (uint32_t)a;
+	do {
+		v = REG32(ADI_RD_DATA);
+		if (ticks() - t0 > TICKS_PER_MS)
+			return -1;
+	} while (v & ADI_RD_BUSY);
+	if (((v >> 16) & 0xffff) != ((a & 0xffff) >> 2))
+		return -1;
+	return v & 0xffff;
+}
+
+static int adi_write(uint32_t off, uint16_t val)
+{
+	if (wait32(ADI_FIFO_STS, ADI_FIFO_FULL, 0))
+		return -1;
+	REG32(ADI_SLAVE + off) = val;
+	return wait32(ADI_FIFO_STS, ADI_FIFO_EMPTY, ADI_FIFO_EMPTY);
+}
+
+/* u-boot's pmic_lowpower_config(), which our boot chain otherwise skips */
+static void pmic_lowpower_init(void)
+{
+	unsigned int i;
+	int v, chip;
+
+	chip = adi_read(PMIC_CHIP_ID_LOW);
+	pmic_status.chip_id = (uint32_t)chip;
+	for (i = 0; i < sizeof(pmic_seq) / sizeof(pmic_seq[0]); i++) {
+		uint16_t val = pmic_seq[i].val;
+		uint64_t t0;
+
+		v = adi_read(pmic_seq[i].off);
+		if (i < 64)
+			pmic_status.before[i] = (uint16_t)v;
+		if (v < 0)
+			pmic_status.errors++;
+
+		switch (pmic_seq[i].op) {
+		case PMIC_GET_PROT:
+			t0 = ticks();
+			while (!(adi_read(pmic_seq[i].off) & 0x8000))
+				if (ticks() - t0 > 10 * TICKS_PER_MS) {
+					pmic_status.errors++;
+					break;
+				}
+			continue;
+		case PMIC_OR:
+			if (v < 0)
+				continue;
+			val |= (uint16_t)v;
+			break;
+		default:
+			if (pmic_seq[i].off == PMIC_SLP_DCDC_LP_CTRL &&
+			    chip >= 0xb000)
+				val = PMIC_SLP_DCDC_LP_CTRL_B;
+			break;
+		}
+		if (adi_write(pmic_seq[i].off, val))
+			pmic_status.errors++;
+	}
+}
+
 /*
  * Called by the SPL at EL3 on CPU0, on the SPL's stack, just before the jump
  * to Linux. Also does the stock BL31's one-time core power setup (plat setup
@@ -1147,6 +1239,12 @@ int mon_init(uint64_t spl_vbar)
 		*r = pmu_seq[i].val;
 	}
 	dsb();
+
+	/* u-boot runs pmic_lowpower_config() just before CSP_Init */
+	for (p = (volatile uint64_t *)&pmic_status;
+	     p < (volatile uint64_t *)(&pmic_status + 1); p++)
+		*p = 0;
+	pmic_lowpower_init();
 
 	/* and the rest of u-boot's CSP_Init, in its order */
 	for (i = 0; i < sizeof(csp_ops) / sizeof(csp_ops[0]); i++) {
