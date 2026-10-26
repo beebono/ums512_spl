@@ -2,13 +2,16 @@
  * cfw EL3 monitor: PSCI 1.0 subset and the ums512 core power sequence.
  *
  * Implemented: PSCI_VERSION, PSCI_FEATURES, CPU_ON, AFFINITY_INFO,
- * MIGRATE_INFO_TYPE, CPU_OFF and CPU_SUSPEND (standby, and core power-down).
- * CPU_OFF powers the core down through the PMU; CPU_ON powers it up again
- * and it comes back through its reset vector (mon_warm_entry). A power-down
- * CPU_SUSPEND is the same sequence with the core's wake-up enable set: an
- * interrupt for it powers it back up, and it resumes at the entry point
- * Linux gave. Everything else returns NOT_SUPPORTED: SYSTEM_RESET/OFF then
- * fall through to the sc27xx handlers.
+ * MIGRATE_INFO_TYPE, CPU_OFF, CPU_SUSPEND (standby, and core power-down)
+ * and SYSTEM_SUSPEND. CPU_OFF powers the core down through the PMU; CPU_ON
+ * powers it up again and it comes back through its reset vector
+ * (mon_warm_entry). A power-down CPU_SUSPEND is the same sequence with the
+ * core's wake-up enable set: an interrupt for it powers it back up, and it
+ * resumes at the entry point Linux gave. SYSTEM_SUSPEND, with every other
+ * core off, takes the cluster and AP_SYS down with it and lets the PMU put
+ * the SoC in deep sleep; it wakes through an IRAM trampoline. Everything
+ * else returns NOT_SUPPORTED: SYSTEM_RESET/OFF then fall through to the
+ * sc27xx handlers.
  *
  * The register sequences are those of the stock SML (Unisoc TF-A v1.4,
  * plat_sprd_psci_pm_ops), decoded from the v1.44 PAC.
@@ -68,6 +71,158 @@ static const uint8_t pd_status_shift[MON_NCPUS] = {
 /* Reset vector per core, in words (the roc1 u-boot writes addr >> 2 too). */
 #define AON_SEC_RVBARADDR(n)	(0x32880040UL + 4 * (n))
 
+/*
+ * System suspend. The cluster level (stock 0x1010 / 0xfcc) and the system
+ * level (0xf04 / 0xea8, 0x8e8 / 0x8d4, 0x8fc) of the stock BL31's
+ * pwr_domain_suspend and suspend_finish.
+ */
+#define PMU_LTEPLL_REL_CFG	0x0a0
+#define PMU_PD_AP_SYS_CFG	0x01c
+#define PMU_AP_DSLP_ENA		0x208
+#define PMU_APCPU_TOP_DSLP_ENA	0x214
+#define PMU_PUB_ACC_RDY		0x250
+#define PMU_GIC_CFG		0x3a8
+#define AON_APB_BASE		0x327d0000UL
+#define AON_APB_SET(r)		(AON_APB_BASE + 0x1000 + (r))
+#define AON_APB_CLR(r)		(AON_APB_BASE + 0x2000 + (r))
+#define AON_APB_EB1		0x004
+#define AON_APB_EB1_AP_SYSCNT	(1u << 17)	/* what stock enables before restarting the counter */
+#define AON_APB_EB2		0x008
+#define AON_APB_EB2_SLEEP_OFF	0x01c00000u	/* bits 22-24, off for the sleep */
+#define AON_SEC_BASE		0x32880000UL
+#define AON_SEC_SET(r)		(AON_SEC_BASE + 0x1000 + (r))
+#define AON_SEC_CLR(r)		(AON_SEC_BASE + 0x2000 + (r))
+#define AON_SEC_APCPU_APB_EB	0x024
+/* The memory-mapped system counter (APCPU_TS0); it loses power in deep sleep */
+#define SYSCNT_BASE		0x32610000UL
+#define SYSCNT_CNTCR		0x00
+#define SYSCNT_CNTCV_LO		0x08
+#define SYSCNT_CNTCV_HI		0x0c
+#define SYSCNT_CNTFID0		0x20
+/* The wake trampoline's home in IRAM (RVBARADDR 2), as stock. Free once the
+ * SPL is done with its early stack (0x3000 down) and Linux runs. */
+#define IRAM_TRAMP		0x8UL
+
+/*
+ * The AP_SYS registers that lose their contents when AP_SYS powers down,
+ * the stock BL31's three save tables (+0xcee8, +0xd1e0, +0xd098): AP_AHB,
+ * AP_APB and AP_CLK_CORE. Saved before the sleep, restored in this order.
+ */
+static const uint32_t ap_sys_regs[] = {
+	0x20100000, 0x2010000c, 0x20100010, 0x20100014, 0x20100018, 0x20100020,
+	0x20100024, 0x20100028, 0x2010002c, 0x20100040, 0x2010004c, 0x20100050,
+	0x201000a8, 0x20100054, 0x20100058, 0x2010005c, 0x20100060, 0x20100064,
+	0x20100068, 0x2010006c, 0x20100070, 0x20100074, 0x20100078, 0x2010007c,
+	0x20100088, 0x2010008c, 0x20100090, 0x20100094, 0x20100098, 0x2010009c,
+	0x201000a0, 0x201000a4, 0x201000ac, 0x201000b0, 0x201000b8, 0x201000bc,
+	0x201000d4, 0x201000d8, 0x20100100, 0x20100104, 0x20100108, 0x2010010c,
+	0x20100110, 0x20100114, 0x20100118, 0x2010011c, 0x20100120, 0x20100124,
+	0x20103014, 0x2010301c, 0x20103034, 0x20103084, 0x20103090, 0x20103094,
+
+	0x71000000, 0x71000004, 0x71000008,
+
+	0x20200020, 0x20200024, 0x20200028, 0x2020002c, 0x20200030, 0x20200034,
+	0x20200038, 0x2020003c, 0x20200040, 0x20200044, 0x20200048, 0x2020004c,
+	0x20200050, 0x20200054, 0x20200058, 0x2020005c, 0x20200060, 0x20200064,
+	0x20200068, 0x2020006c, 0x20200070, 0x20200074, 0x20200078, 0x2020007c,
+	0x20200080, 0x20200084, 0x20200088, 0x2020008c, 0x20200090, 0x20200094,
+	0x20200098, 0x2020009c, 0x202000a0, 0x202000a4, 0x202000a8, 0x202000ac,
+	0x202000b0, 0x202000b4, 0x202000b8, 0x202000bc, 0x202000c0,
+};
+#define N_AP_SYS_REGS	(sizeof(ap_sys_regs) / sizeof(ap_sys_regs[0]))
+#define AP_SYS_AP_AHB_EB	0	/* index of 0x20100000 */
+#define AP_SYS_AP_APB_EB	54	/* index of 0x71000000 */
+static uint32_t ap_sys_saved[N_AP_SYS_REGS];
+
+/* GICv3 distributor, secure view */
+#define GICD_BASE		0x12000000UL
+#define GICD_CTLR		0x0000
+#define GICD_TYPER		0x0004
+#define GICD_IGROUPR		0x0080
+#define GICD_ISENABLER		0x0100
+#define GICD_ISPENDR		0x0200
+#define GICD_IPRIORITYR		0x0400
+#define GICD_ICFGR		0x0c00
+#define GICD_IGRPMODR		0x0d00
+#define GICD_NSACR		0x0e00
+#define GICD_IROUTER		0x6000
+#define GICD_CTLR_ENABLES	0x7u		/* Grp0, Grp1NS, Grp1S */
+#define GICD_CTLR_RWP		(1u << 31)
+#define GIC_MAX_LINES		1024
+/* SGI/PPI frame of a redistributor */
+#define GICR_ISENABLER0		(0x10000 + 0x0100)
+#define GICR_IPRIORITYR0	(0x10000 + 0x0400)
+#define GICR_ICFGR0		(0x10000 + 0x0c00)
+#define GICR_NSACR		(0x10000 + 0x0e00)
+
+/* AP sleep setup the stock plat setup does once (0xf6c, 0x1a64) */
+#define PMU_SLEEP_CTRL		0x0cc
+#define PMU_AP_FORCE_DEEP_SLEEP	(1u << 16)
+#define PMU_LIGHT_SLEEP_ENABLE	0x230
+#define PMU_AP_LSLP_ENA		(1u << 0)
+#define PMU_AP_SMART_LSLP_ENA	(1u << 16)
+#define PMU_DOZE_SLEEP_ENABLE	0x238
+#define PMU_AP_DOZE_ENA		(1u << 1)
+#define PMU_GICDISABLE		(1u << 0)	/* in PMU_GIC_CFG */
+#define AP_APB_BASE		0x71000000UL
+#define AP_APB_CLR(r)		(AP_APB_BASE + 0x2000 + (r))
+#define AP_APB_SIM0_EB		(1u << 0)	/* in AP_APB_EB, 0x000 */
+#define AON_APB_EB2_AP_SIM_AON_TOP (1u << 3)
+
+/*
+ * The AP INTCs' enables (INTC0-5 + 0x8): which interrupts the PMU may wake
+ * AP_SYS from deep sleep for, SPI numbered. Stock's list (0x81c), which
+ * covers ours: the AP GPIOs (61: the hall switch, the buttons), the EICs
+ * (72), the PMIC behind the ADI (173: power key, RTC), the mailbox (82), USB
+ * (69) and the watchdog (79).
+ */
+static const uint8_t wake_spis[] = {
+	180, 188, 173, 104, 94, 93, 92, 91, 90, 89, 83, 82, 80, 79, 78, 72,
+	71, 70, 69, 67, 61,
+};
+#define AP_INTC_BASE(n)		(0x32310000UL + 0x10000 * (n))
+#define AP_INTC_STS		0x0	/* masked status */
+#define AP_INTC_RAW		0x4
+#define AP_INTC_EN(n)		(AP_INTC_BASE(n) + 0x8)
+static uint32_t intc_stock_en[6];
+
+/*
+ * Clocks the BootROM and SPL leave on that nothing in Linux owns (the
+ * clock driver marks them CLK_IGNORE_UNUSED, so they stay on for good), and
+ * that keep AP_SYS from deep sleep: CoreSight, the CPU debug port and the
+ * bus monitors, and the two UARTs, which the CFW doesn't use. Gated for the
+ * sleep only, like stock's APCPU_CSSYS_EB: the bits that were on come back
+ * on in the resume.
+ */
+#define AON_APB_EB0		0x000
+#define AON_EB0_SLEEP_OFF	(0xfu << 14)	/* APCPU_DAP, CSSYS, CSSYS_APB, CSSYS_PUB */
+#define AON_EB1_SLEEP_OFF	((1u << 16) | (1u << 18))	/* DJTAG_CTRL, APB_BUSMON */
+#define AP_AHB_BASE		0x20100000UL
+#define AP_AHB_EB_SLEEP_OFF	(1u << 8)	/* BUSMON_CLOCK */
+#define AP_APB_EB_SLEEP_OFF	((1u << 14) | (1u << 15))	/* UART0, UART1 */
+static uint32_t sleep_off_eb0, sleep_off_eb1;
+
+/* What mon_sys.snap records at SYSTEM_SUSPEND entry, at 0xf750 */
+static const uint32_t sys_snap_regs[16] = {
+	0x327d0000,	/* AON_APB_EB0 (GPU_EB b11, MM_EB b9) */
+	0x327d0004,	/* AON_APB_EB1 (OTG_UTMI_EB) */
+	0x327d0008,	/* AON_APB_EB2 */
+	0x20100000,	/* AP_AHB_EB (DISPC_EB) */
+	0x71000000,	/* AP_APB_EB */
+	0x327e00bc,	/* PMU PWR_STATUS0_DBG */
+	0x327e00c0,	/* PWR_STATUS1_DBG */
+	0x327e00c4,	/* PWR_STATUS2_DBG */
+	0x327e010c,	/* PWR_STATUS3_DBG (GPU_TOP, MM) */
+	0x327e00b8,	/* PWR_STATUS4_DBG */
+	0x327e00d4,	/* SLEEP_STATUS */
+	0x327e00cc,	/* SLEEP_CTRL */
+	0x327e0084,	/* XTL0_REL_CFG */
+	0x327e07b8,	/* DDR_SLP_CTRL_STATE */
+	0x327e0378,	/* APCU_PWR_STATE0 */
+	0x327e0820,	/* APCU_PWR_STATE1 */
+};
+#define AP_INTCS		6
+
 #define GICR_BASE		0x12040000UL
 #define GICR_STRIDE		0x20000UL
 #define GICR_FRAMES		8
@@ -93,6 +248,8 @@ static const uint8_t pd_status_shift[MON_NCPUS] = {
 #define PSCI_FEATURES		0x8400000a
 #define PSCI_CPU_SUSPEND_32	0x84000001
 #define PSCI_CPU_SUSPEND_64	0xc4000001
+#define PSCI_SYSTEM_SUSPEND_32	0x8400000e
+#define PSCI_SYSTEM_SUSPEND_64	0xc400000e
 
 /* power_state, original format: StateID [15:0], type [16], level [25:24] */
 #define PSTATE_TYPE_PWRDN	(1u << 16)
@@ -101,6 +258,7 @@ static const uint8_t pd_status_shift[MON_NCPUS] = {
 #define PSCI_SUCCESS		0
 #define PSCI_NOT_SUPPORTED	-1
 #define PSCI_INVALID_PARAMS	-2
+#define PSCI_DENIED		-3
 #define PSCI_ALREADY_ON		-4
 #define PSCI_ON_PENDING		-5
 #define PSCI_INTERNAL_FAILURE	-6
@@ -132,6 +290,27 @@ static struct mon_susp susp_stats __attribute__((section(".status_susp")));
 static volatile struct mon_susp *const ss = &susp_stats;
 /* likewise for csp_ops, at MON_BASE + 0xf500 */
 static uint32_t csp_before[96] __attribute__((section(".status_csp")));
+static struct mon_sys sys_stats __attribute__((section(".status_sys")));
+static volatile struct mon_sys *const sy = &sys_stats;
+static struct mon_sys sys_prev __attribute__((section(".status_sys_prev")));
+
+/* GIC state across a system suspend: the distributor's SPIs, and the SGI/PPI
+ * frame of the core that suspends (the others are off, and Linux sets theirs
+ * up again as it brings them back) */
+static struct {
+	uint32_t igroupr[GIC_MAX_LINES / 32];
+	uint32_t isenabler[GIC_MAX_LINES / 32];
+	uint32_t ispendr[GIC_MAX_LINES / 32];
+	uint32_t igrpmodr[GIC_MAX_LINES / 32];
+	uint32_t ipriorityr[GIC_MAX_LINES / 4];
+	uint32_t icfgr[GIC_MAX_LINES / 16];
+	uint32_t nsacr[GIC_MAX_LINES / 16];
+	uint32_t irouter[GIC_MAX_LINES][2];
+	uint32_t r_isenabler0;
+	uint32_t r_ipriorityr[8];
+	uint32_t r_icfgr[2];
+	uint32_t r_nsacr;
+} gic_ctx;
 
 static inline void dsb(void)
 {
@@ -283,12 +462,193 @@ static uint32_t gic_cpuif_disable(unsigned int core)
 	return flags;
 }
 
+static void gicd_wait_rwp(void)
+{
+	wait32(GICD_BASE + GICD_CTLR, GICD_CTLR_RWP, 0);
+}
+
+/* The distributor's SPI state and this core's SGIs/PPIs (TF-A's
+ * gicv3_distif_save / gicv3_rdistif_save, cut to what Linux uses: no LPIs,
+ * no active state). */
+static void gic_save(unsigned int core)
+{
+	uint32_t lines, i, f = 0;
+	unsigned long rd = gic_redist(core, &f);
+
+	lines = ((REG32(GICD_BASE + GICD_TYPER) & 0x1f) + 1) * 32;
+	if (lines > GIC_MAX_LINES)
+		lines = GIC_MAX_LINES;
+	sy->gicd_lines = lines;
+	sy->gicd_ctlr = REG32(GICD_BASE + GICD_CTLR);
+
+	for (i = 1; i < lines / 32; i++) {
+		gic_ctx.igroupr[i] = REG32(GICD_BASE + GICD_IGROUPR + 4 * i);
+		gic_ctx.isenabler[i] = REG32(GICD_BASE + GICD_ISENABLER + 4 * i);
+		gic_ctx.ispendr[i] = REG32(GICD_BASE + GICD_ISPENDR + 4 * i);
+		gic_ctx.igrpmodr[i] = REG32(GICD_BASE + GICD_IGRPMODR + 4 * i);
+	}
+	for (i = 32 / 4; i < lines / 4; i++)
+		gic_ctx.ipriorityr[i] = REG32(GICD_BASE + GICD_IPRIORITYR + 4 * i);
+	for (i = 32 / 16; i < lines / 16; i++) {
+		gic_ctx.icfgr[i] = REG32(GICD_BASE + GICD_ICFGR + 4 * i);
+		gic_ctx.nsacr[i] = REG32(GICD_BASE + GICD_NSACR + 4 * i);
+	}
+	for (i = 32; i < lines; i++) {
+		gic_ctx.irouter[i][0] = REG32(GICD_BASE + GICD_IROUTER + 8 * i);
+		gic_ctx.irouter[i][1] = REG32(GICD_BASE + GICD_IROUTER + 8 * i + 4);
+	}
+
+	gic_ctx.r_isenabler0 = REG32(rd + GICR_ISENABLER0);
+	for (i = 0; i < 8; i++)
+		gic_ctx.r_ipriorityr[i] = REG32(rd + GICR_IPRIORITYR0 + 4 * i);
+	gic_ctx.r_icfgr[0] = REG32(rd + GICR_ICFGR0);
+	gic_ctx.r_icfgr[1] = REG32(rd + GICR_ICFGR0 + 4);
+	gic_ctx.r_nsacr = REG32(rd + GICR_NSACR);
+}
+
+/* Distributor first, with affinity routing on and the groups off until the
+ * end (TF-A gicv3_distif_init_restore), then this core's redistributor,
+ * which the caller has powered up and woken. Harmless if nothing was lost. */
+static void gic_restore(unsigned int core)
+{
+	uint32_t lines = sy->gicd_lines, i, f = 0;
+	unsigned long rd = gic_redist(core, &f);
+
+	REG32(GICD_BASE + GICD_CTLR) = sy->gicd_ctlr & ~GICD_CTLR_ENABLES;
+	gicd_wait_rwp();
+	for (i = 1; i < lines / 32; i++) {
+		REG32(GICD_BASE + GICD_IGROUPR + 4 * i) = gic_ctx.igroupr[i];
+		REG32(GICD_BASE + GICD_IGRPMODR + 4 * i) = gic_ctx.igrpmodr[i];
+	}
+	for (i = 32 / 4; i < lines / 4; i++)
+		REG32(GICD_BASE + GICD_IPRIORITYR + 4 * i) = gic_ctx.ipriorityr[i];
+	for (i = 32 / 16; i < lines / 16; i++) {
+		REG32(GICD_BASE + GICD_ICFGR + 4 * i) = gic_ctx.icfgr[i];
+		REG32(GICD_BASE + GICD_NSACR + 4 * i) = gic_ctx.nsacr[i];
+	}
+	for (i = 32; i < lines; i++) {
+		REG32(GICD_BASE + GICD_IROUTER + 8 * i) = gic_ctx.irouter[i][0];
+		REG32(GICD_BASE + GICD_IROUTER + 8 * i + 4) = gic_ctx.irouter[i][1];
+	}
+	for (i = 1; i < lines / 32; i++) {
+		REG32(GICD_BASE + GICD_ISPENDR + 4 * i) = gic_ctx.ispendr[i];
+		REG32(GICD_BASE + GICD_ISENABLER + 4 * i) = gic_ctx.isenabler[i];
+	}
+	REG32(GICD_BASE + GICD_CTLR) = sy->gicd_ctlr;
+	gicd_wait_rwp();
+
+	for (i = 0; i < 8; i++)
+		REG32(rd + GICR_IPRIORITYR0 + 4 * i) = gic_ctx.r_ipriorityr[i];
+	REG32(rd + GICR_ICFGR0) = gic_ctx.r_icfgr[0];
+	REG32(rd + GICR_ICFGR0 + 4) = gic_ctx.r_icfgr[1];
+	REG32(rd + GICR_NSACR) = gic_ctx.r_nsacr;
+	REG32(rd + GICR_ISENABLER0) = gic_ctx.r_isenabler0;
+}
+
+/* Cluster power-down (stock 0x1010, then CLUSTERPWRDN_EL1 = 0) */
+static void cluster_down(void)
+{
+	REG32(PMU_SET(PMU_APCPU_TOP_DSLP_ENA)) = 1;
+	REG32(PMU_CLR(PMU_PD_APCPU_TOP_CFG)) = PD_FORCE_SHUTDOWN;
+	REG32(PMU_SET(PMU_PD_APCPU_TOP_CFG)) = PD_AUTO_SHUTDOWN_EN;
+	REG32(PMU_SET(PMU_PD_APCPU_TOP_CFG)) = PD_SEL;
+	asm volatile("msr S3_0_C15_C3_6, xzr\n" "isb");
+}
+
+/* ... and back (0xfcc; CLUSTERPWRCTLR = 0xf0, CLUSTERPWRDN = 2) */
+static void cluster_up(void)
+{
+	REG32(PMU_CLR(PMU_APCPU_TOP_DSLP_ENA)) = 1;
+	REG32(PMU_CLR(PMU_PD_APCPU_TOP_CFG)) = PD_FORCE_SHUTDOWN;
+	REG32(PMU_SET(PMU_PD_APCPU_TOP_CFG)) = PD_AUTO_SHUTDOWN_EN;
+	REG32(PMU_SET(PMU_PD_APCPU_TOP_CFG)) = PD_SEL;
+	asm volatile(
+		"msr	S3_0_C15_C3_5, %0\n"
+		"isb\n"
+		"msr	S3_0_C15_C3_6, %1\n"
+		"isb\n"
+		:: "r" (0xf0UL), "r" (2UL));
+}
+
+/* AP_SYS deep sleep enabled, its clocks parked (stock 0xf04, 0x8e8) */
+static void system_down(void)
+{
+	REG32(AON_SEC_CLR(AON_SEC_APCPU_APB_EB)) = 1;
+	REG32(PMU_SET(PMU_LTEPLL_REL_CFG)) = 1;
+	REG32(PMU_CLR(PMU_LTEPLL_REL_CFG)) = 0x10;
+	REG32(PMU_SET(PMU_GIC_CFG)) = 1;
+	REG32(PMU_SET(PMU_AP_DSLP_ENA)) = 1;
+	REG32(PMU_CLR(PMU_PD_AP_SYS_CFG)) = PD_FORCE_SHUTDOWN;
+	REG32(PMU_SET(PMU_PD_AP_SYS_CFG)) = PD_AUTO_SHUTDOWN_EN;
+	REG32(AON_APB_CLR(AON_APB_EB2)) = AON_APB_EB2_SLEEP_OFF;
+}
+
+/* ... and back (0xea8, 0x8d4), without the register tables or the counter */
+static void system_up(void)
+{
+	REG32(PMU_CLR(PMU_GIC_CFG)) = 1;
+	REG32(PMU_SET(PMU_LTEPLL_REL_CFG)) = 0x10;
+	REG32(PMU_CLR(PMU_AP_DSLP_ENA)) = 1;
+	REG32(PMU_CLR(PMU_PD_AP_SYS_CFG)) = PD_FORCE_SHUTDOWN;
+	REG32(PMU_SET(PMU_PD_AP_SYS_CFG)) = PD_AUTO_SHUTDOWN_EN;
+	REG32(AON_SEC_SET(AON_SEC_APCPU_APB_EB)) = 1;
+}
+
+/* After the AP_SYS tables are saved, so their restore turns the AP_AHB
+ * and AP_APB bits back on by itself */
+static void sleep_clocks_off(void)
+{
+	sleep_off_eb0 = REG32(AON_APB_BASE + AON_APB_EB0) & AON_EB0_SLEEP_OFF;
+	sleep_off_eb1 = REG32(AON_APB_BASE + AON_APB_EB1) & AON_EB1_SLEEP_OFF;
+	REG32(AON_APB_CLR(AON_APB_EB0)) = AON_EB0_SLEEP_OFF;
+	REG32(AON_APB_CLR(AON_APB_EB1)) = AON_EB1_SLEEP_OFF;
+	REG32(AP_AHB_BASE + 0x2000) = AP_AHB_EB_SLEEP_OFF;
+	REG32(AP_APB_CLR(0x000)) = AP_APB_EB_SLEEP_OFF;
+}
+
+/*
+ * Arm only the wake sources Linux armed. By now it has masked every
+ * interrupt that isn't a wake source at the GIC, but the INTCs know nothing
+ * of that: a masked line that stays asserted (USB with the cable pulled)
+ * never wakes the core, yet the PMU counts it as a wake request and won't
+ * let AP_SYS sleep. INTC bit n is SPI n, GICD_ISENABLER word n / 32 + 1.
+ */
+static void intc_arm_for_sleep(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < AP_INTCS; i++) {
+		sy->intc_armed[i] = intc_stock_en[i] & gic_ctx.isenabler[i + 1];
+		REG32(AP_INTC_EN(i)) = sy->intc_armed[i];
+	}
+	dsb();
+	for (i = 0; i < AP_INTCS; i++) {
+		sy->intc_blocking[i] = REG32(AP_INTC_BASE(i) + AP_INTC_STS);
+		sy->intc_raw[i] = REG32(AP_INTC_BASE(i) + AP_INTC_RAW);
+	}
+}
+
+static void intc_restore(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < AP_INTCS; i++)
+		REG32(AP_INTC_EN(i)) = intc_stock_en[i];
+}
+
+static void sleep_clocks_on(void)
+{
+	REG32(AON_APB_SET(AON_APB_EB0)) = sleep_off_eb0;
+	REG32(AON_APB_SET(AON_APB_EB1)) = sleep_off_eb1;
+}
+
 /*
  * The stock core power-down (0x1338 for an off, 0x1604 for a suspend, which
- * differ only in the wake-up bit), then the core's own power-down request.
- * Returns once the PMU reports it ready; the caller's WFI powers it off.
+ * differ only in the wake-up bit), then the core's own power-down request,
+ * then for level 1 the cluster's and for level 2 AP_SYS's as well. Returns
+ * once the PMU reports the core ready; the caller's WFI powers it off.
  */
-static void core_power_down(unsigned int core, int wake_on_irq)
+static void core_power_down(unsigned int core, int wake_on_irq, int level)
 {
 	volatile struct mon_cpu *c = &st->cpu[core];
 	uint64_t t0;
@@ -297,8 +657,12 @@ static void core_power_down(unsigned int core, int wake_on_irq)
 	c->off_step = MON_OFF_STEP_GIC_OFF;
 	c->flags |= gic_cpuif_disable(core);
 	/* stock trusts the DynamIQ hardware flush on power-down; a set/way
-	 * clean of L1/L2 costs microseconds and doesn't depend on it */
-	mon_flush_private_dcache();
+	 * clean of L1/L2 costs microseconds and doesn't depend on it. The
+	 * cluster going down takes L3 too, and DRAM goes to self-refresh. */
+	if (level)
+		mon_flush_dcache_all();
+	else
+		mon_flush_private_dcache();
 	c->off_step = MON_OFF_STEP_FLUSHED;
 	dsb();
 
@@ -315,6 +679,10 @@ static void core_power_down(unsigned int core, int wake_on_irq)
 
 	asm volatile("msr dbgprcr_el1, xzr");
 	write_cpupwrctlr(CPUPWRCTLR_CORE_PWRDN_EN);
+	if (level >= 1)
+		cluster_down();
+	if (level >= 2)
+		system_down();
 	c->off_step = MON_OFF_STEP_PMU_ARMED;
 	dsb();
 
@@ -345,7 +713,7 @@ static void __attribute__((noreturn)) core_off_wfi(unsigned int core)
 {
 	volatile struct mon_cpu *c = &st->cpu[core];
 
-	core_power_down(core, 0);
+	core_power_down(core, 0, 0);
 	c->state = MON_OFF;
 	c->off_step = MON_OFF_STEP_WFI;
 	dsb();
@@ -359,6 +727,45 @@ static void __attribute__((noreturn)) core_off_wfi(unsigned int core)
 
 static void __attribute__((noreturn)) mon_resume(unsigned int core);
 
+/*
+ * Back from a system suspend, through the IRAM trampoline: AP_SYS and the
+ * cluster as stock's suspend_finish leaves them (0xea8, the tables, 0x8d4,
+ * 0x8fc, 0xfcc, CLUSTERPWRCTLR, the GIC). The counter restarts where it
+ * stopped rather than at stock's 0: Linux's clocksource is not nonstop
+ * (arm,no-tick-in-suspend) and takes the time asleep from the RTC.
+ */
+static void system_resume(unsigned int core)
+{
+	uint32_t i;
+
+	sy->resumed++;
+	sy->pub_acc_rdy = REG32(PMU_BASE + PMU_PUB_ACC_RDY);
+	for (i = 0; i < AP_INTCS; i++)
+		sy->intc_wake[i] = REG32(AP_INTC_BASE(i) + AP_INTC_STS);
+	intc_restore();
+	system_up();
+	for (i = 0; i < N_AP_SYS_REGS; i++)
+		REG32(ap_sys_regs[i]) = ap_sys_saved[i];
+	REG32(AON_APB_SET(AON_APB_EB2)) = AON_APB_EB2_SLEEP_OFF;
+	sleep_clocks_on();
+
+	REG32(AON_APB_SET(AON_APB_EB1)) = AON_APB_EB1_AP_SYSCNT;
+	sy->cnt_wake = (uint64_t)REG32(SYSCNT_BASE + SYSCNT_CNTCV_HI) << 32 |
+		       REG32(SYSCNT_BASE + SYSCNT_CNTCV_LO);
+	REG32(SYSCNT_BASE + SYSCNT_CNTCR) = 0;
+	REG32(SYSCNT_BASE + SYSCNT_CNTFID0) = MON_CNTFRQ;
+	REG32(SYSCNT_BASE + SYSCNT_CNTCV_LO) = (uint32_t)sy->cnt_suspend;
+	REG32(SYSCNT_BASE + SYSCNT_CNTCV_HI) = (uint32_t)(sy->cnt_suspend >> 32);
+	REG32(SYSCNT_BASE + SYSCNT_CNTCR) = 1;
+
+	cluster_up();
+	sy->gicd_ctlr_wake = REG32(GICD_BASE + GICD_CTLR);
+	st->cpu[core].flags |= gic_redist_init(core);
+	gic_restore(core);
+	sy->in_progress = 0;
+	dsb();
+}
+
 /* First C on a secondary after reset (entry.S), on its own EL3 stack. */
 void __attribute__((noreturn)) mon_warm(unsigned int core)
 {
@@ -368,8 +775,11 @@ void __attribute__((noreturn)) mon_warm(unsigned int core)
 	dsb();
 	el3_setup();
 
-	if (c->state == MON_SUSPENDED)
+	if (c->state == MON_SUSPENDED) {
 		ss->resumed[core]++;
+		if (sy->in_progress)
+			system_resume(core);
+	}
 
 	/*
 	 * Powered up with neither a CPU_ON nor a suspend for it: the PMU woke
@@ -499,7 +909,7 @@ static void __attribute__((noreturn)) psci_cpu_off(void)
  * powers it back up through the reset vector into mon_warm. If the WFI
  * returns with the power still on (something was already pending), resume
  * the same way, so Linux sees one path. Cluster and system levels are
- * stage 3.
+ * SYSTEM_SUSPEND's.
  */
 static int64_t psci_cpu_suspend(uint32_t pstate, uint64_t entry, uint64_t context)
 {
@@ -521,10 +931,69 @@ static int64_t psci_cpu_suspend(uint32_t pstate, uint64_t entry, uint64_t contex
 	REG32(AON_SEC_RVBARADDR(core)) = (uint32_t)(MON_BASE >> 2);
 	c->state = MON_SUSPENDED;
 	dsb();
-	core_power_down(core, 1);
+	core_power_down(core, 1, 0);
 	asm volatile("wfi");
 
 	ss->early[core]++;
+	dsb();
+	el3_setup();
+	mon_resume(core);
+}
+
+/*
+ * SYSTEM_SUSPEND, the last core up (Linux has CPU_OFF'd the others): the
+ * core, the cluster and AP_SYS all power down, and the PMU takes the SoC
+ * into deep sleep once the other subsystems agree. A wake-up powers the
+ * core up at the IRAM trampoline, which waits for DRAM and comes back
+ * through mon_warm -> system_resume -> mon_resume into Linux's entry point.
+ */
+static int64_t psci_system_suspend(uint64_t entry, uint64_t context)
+{
+	unsigned int core = my_core(), i;
+	volatile struct mon_cpu *c = &st->cpu[core];
+
+	sy->calls++;
+	for (i = 0; i < 16; i++)
+		sy->snap[i] = REG32(sys_snap_regs[i]);
+	for (i = 0; i < MON_NCPUS; i++) {
+		if (i == core)
+			continue;
+		if (st->cpu[i].state != MON_OFF || (st->cpu[i].flags & MON_F_PARKED) ||
+		    core_pwr_state(i) != PWR_STATE_OFF) {
+			sy->denied++;
+			sy->denied_core = i;
+			return PSCI_DENIED;
+		}
+	}
+
+	c->entry = entry;
+	c->context = context;
+	gic_save(core);
+	intc_arm_for_sleep();
+	for (i = 0; i < N_AP_SYS_REGS; i++)
+		ap_sys_saved[i] = REG32(ap_sys_regs[i]);
+	sleep_clocks_off();
+	sy->cnt_suspend = ticks();
+	for (i = 0; i < (uint32_t)(mon_tramp_end - mon_tramp); i++)
+		REG32(IRAM_TRAMP + 4 * i) = mon_tramp[i];
+	REG32(AON_SEC_RVBARADDR(core)) = (uint32_t)(IRAM_TRAMP >> 2);
+	c->state = MON_SUSPENDED;
+	sy->in_progress = 1;
+	dsb();
+	core_power_down(core, 1, 2);
+	asm volatile("wfi");
+
+	/* an interrupt was already pending: nothing powered down, and nothing
+	 * lost its state, so only the PMU and clock setup is undone */
+	sy->early++;
+	intc_restore();
+	system_up();
+	REG32(AON_APB_SET(AON_APB_EB2)) = AON_APB_EB2_SLEEP_OFF;
+	sleep_clocks_on();
+	REG32(AP_AHB_BASE + 0x1000) = ap_sys_saved[AP_SYS_AP_AHB_EB] & AP_AHB_EB_SLEEP_OFF;
+	REG32(AP_APB_BASE + 0x1000) = ap_sys_saved[AP_SYS_AP_APB_EB] & AP_APB_EB_SLEEP_OFF;
+	cluster_up();
+	sy->in_progress = 0;
 	dsb();
 	el3_setup();
 	mon_resume(core);
@@ -562,6 +1031,8 @@ static int64_t psci_features(uint32_t fid)
 	case PSCI_AFFINITY_INFO_64:
 	case PSCI_MIGRATE_INFO_TYPE:
 	case PSCI_FEATURES:
+	case PSCI_SYSTEM_SUSPEND_32:
+	case PSCI_SYSTEM_SUSPEND_64:
 		return PSCI_SUCCESS;
 	case PSCI_CPU_SUSPEND_32:
 	case PSCI_CPU_SUSPEND_64:
@@ -606,6 +1077,12 @@ void mon_smc(struct mon_regs *r)
 	case PSCI_CPU_SUSPEND_64:
 		ret = psci_cpu_suspend((uint32_t)r->x[1], r->x[2], r->x[3]);
 		break;
+	case PSCI_SYSTEM_SUSPEND_32:
+		ret = psci_system_suspend((uint32_t)r->x[1], (uint32_t)r->x[2]);
+		break;
+	case PSCI_SYSTEM_SUSPEND_64:
+		ret = psci_system_suspend(r->x[1], r->x[2]);
+		break;
 	case PSCI_CPU_OFF:
 		psci_cpu_off();
 	case PSCI_MIGRATE_INFO_TYPE:
@@ -643,6 +1120,9 @@ int mon_init(uint64_t spl_vbar)
 		volatile uint64_t *d = (volatile uint64_t *)&status_prev;
 
 		for (p = (volatile uint64_t *)st; p < (volatile uint64_t *)(st + 1); p++)
+			*d++ = (st->magic == 0x31304e4f4d574643ULL) ? *p : 0;
+		d = (volatile uint64_t *)&sys_prev;
+		for (p = (volatile uint64_t *)sy; p < (volatile uint64_t *)(sy + 1); p++)
 			*d++ = (st->magic == 0x31304e4f4d574643ULL) ? *p : 0;
 	}
 	for (p = (volatile uint64_t *)st; p < (volatile uint64_t *)(st + 1); p++)
@@ -689,6 +1169,8 @@ int mon_init(uint64_t spl_vbar)
 		REG32(AON_SEC_RVBARADDR(i)) = (uint32_t)(MON_BASE >> 2);
 	for (p = (volatile uint64_t *)ss; p < (volatile uint64_t *)(ss + 1); p++)
 		*p = 0;
+	for (p = (volatile uint64_t *)sy; p < (volatile uint64_t *)(sy + 1); p++)
+		*p = 0;
 
 	for (i = 0; i < MON_NCPUS; i++)
 		REG32(PMU_CLR(pd_cfg[i])) = PD_DBG_SHUTDOWN_EN;
@@ -697,6 +1179,37 @@ int mon_init(uint64_t spl_vbar)
 	REG32(PMU_SET(PMU_APCPU_CSYSPWRUP_WAKEUP_EN)) = 0xff;
 	REG32(PMU_CLR(PMU_PD_APCPU_TOP_CFG)) = PD_DBG_SHUTDOWN_EN;
 	REG32(PMU_SET(PMU_PD_APCPU_TOP_CFG)) = PD_SEL;
+
+	/* The rest of stock's plat setup: the DSU's cluster power control
+	 * (0x8870 with 0xf: all L3 portions powered, memory retention on a
+	 * cluster power-down), AP light sleep on, doze and forced deep sleep
+	 * off, the GIC's sleep disable released (0xf6c), the SIM clocks off
+	 * (0x1a64), then the AP INTC wake sources (0x81c). Without the INTC
+	 * enables nothing could wake AP_SYS from deep sleep. */
+	asm volatile(
+		"msr	S3_0_C15_C3_5, %0\n"
+		"isb\n"
+		"msr	S3_0_C15_C3_6, %1\n"
+		"isb\n"
+		:: "r" (0xf0UL), "r" (2UL));
+	REG32(PMU_CLR(PMU_GIC_CFG)) = PMU_GICDISABLE;
+	REG32(PMU_CLR(PMU_SLEEP_CTRL)) = PMU_AP_FORCE_DEEP_SLEEP;
+	REG32(PMU_SET(PMU_LIGHT_SLEEP_ENABLE)) = PMU_AP_SMART_LSLP_ENA;
+	REG32(PMU_SET(PMU_LIGHT_SLEEP_ENABLE)) = PMU_AP_LSLP_ENA;
+	REG32(PMU_CLR(PMU_DOZE_SLEEP_ENABLE)) = PMU_AP_DOZE_ENA;
+	REG32(AP_APB_CLR(0x000)) = AP_APB_SIM0_EB;
+	REG32(AON_APB_CLR(AON_APB_EB2)) = AON_APB_EB2_AP_SIM_AON_TOP;
+	{
+		uint32_t en[AP_INTCS] = { 0 };
+
+		for (i = 0; i < sizeof(wake_spis); i++)
+			en[wake_spis[i] / 32] |= 1u << (wake_spis[i] % 32);
+		for (i = 0; i < AP_INTCS; i++) {
+			sy->intc_en_before[i] = REG32(AP_INTC_EN(i));
+			intc_stock_en[i] = en[i];
+			REG32(AP_INTC_EN(i)) = en[i];
+		}
+	}
 	dsb();
 
 	st->cpu[my_core()].state = MON_ON;

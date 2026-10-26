@@ -25,11 +25,13 @@ SECTIONS
 	ASSERT(. <= MON_BASE + 0xe000, "monitor overlaps the previous status page")
 
 	.status_prev MON_BASE + 0xe000 (NOLOAD) : { *(.status_prev) }
+	.status_sys_prev MON_BASE + 0xe700 (NOLOAD) : { *(.status_sys_prev) }
 
 	.status MON_BASE + 0xf000 (NOLOAD) : { *(.status) }
 	.status_susp MON_BASE + 0xf300 (NOLOAD) : { *(.status_susp) }
 	.status_seq MON_BASE + 0xf400 (NOLOAD) : { *(.status_seq) }
 	.status_csp MON_BASE + 0xf500 (NOLOAD) : { *(.status_csp) }
+	.status_sys MON_BASE + 0xf700 (NOLOAD) : { *(.status_sys) }
 	ASSERT(. <= MON_BASE + 0x10000, "status page past the reservation")
 
 	/DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }

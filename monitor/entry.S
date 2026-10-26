@@ -71,13 +71,24 @@ mon_enter_ns:
 /*
  * mon_flush_private_dcache: clean and invalidate the core's own data
  * caches (L1 and L2, cache levels 1-2) by set/way, before it powers down.
- * The DSU's L3 is shared and stays powered, so it is left alone. Runs at
- * EL3 with the MMU off, so nothing here allocates new lines.
- * Clobbers x0-x11.
+ * The DSU's L3 is shared and stays powered, so it is left alone.
+ * mon_flush_dcache_all: every level up to the point of coherency, L3
+ * included, for a cluster that is about to lose power with the other
+ * cores already off. Both run at EL3 with the MMU off, so nothing here
+ * allocates new lines. Clobber x0-x12.
  */
 	.globl	mon_flush_private_dcache
 mon_flush_private_dcache:
+	mov	x12, #4				/* levels 1-2 */
+	b	0f
+
+	.globl	mon_flush_dcache_all
+mon_flush_dcache_all:
 	mrs	x0, clidr_el1
+	ubfx	x12, x0, #24, #3		/* LoC */
+	lsl	x12, x12, #1
+	cbz	x12, 5f
+0:	mrs	x0, clidr_el1
 	mov	x10, xzr			/* level << 1 */
 1:	add	x2, x10, x10, lsr #1		/* level * 3 */
 	lsr	x1, x0, x2
@@ -103,12 +114,36 @@ mon_flush_private_dcache:
 	subs	x7, x7, #1
 	b.ge	2b
 4:	add	x10, x10, #2
-	cmp	x10, #4				/* levels 1 and 2 only */
+	cmp	x10, x12
 	b.lo	1b
 	msr	csselr_el1, xzr
-	dsb	sy
+5:	dsb	sy
 	isb
 	ret
+
+/*
+ * Wake from system suspend: mon_system_suspend copies this to IRAM 0x8 and
+ * points the core's reset vector there (RVBARADDR = 2), as the stock BL31
+ * does. DRAM is not readable until the PUB is out of its deep sleep, so it
+ * spins on PUB_ACC_RDY first, then goes to mon_warm_entry. Position
+ * independent; the literals stay 8-byte aligned as long as the copy's
+ * destination is.
+ */
+	.section .rodata
+	.balign	8
+	.globl	mon_tramp, mon_tramp_end
+mon_tramp:
+	ldr	x0, 2f
+1:	ldr	w1, [x0]
+	cmp	w1, #1
+	b.ne	1b
+	ldr	x1, 3f
+	br	x1
+	.balign	8
+2:	.quad	0x327e0250			/* PMU_APB PUB_ACC_RDY */
+3:	.quad	MON_BASE			/* mon_head: b mon_warm_entry */
+mon_tramp_end:
+	.text
 
 /* Forward an exception to the same slot of the SPL's EL3 vectors, which
  * record it in uboot_log (or handle the EL2 stub's smc #1 checkpoint).

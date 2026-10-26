@@ -108,8 +108,39 @@ struct mon_susp {
 	uint32_t resumed[MON_NCPUS];	/* came back through the reset vector */
 };
 
+/* SYSTEM_SUSPEND, at MON_BASE + 0xf700; the previous boot's at + 0xe700 */
+struct mon_sys {
+	uint32_t calls;		/* SYSTEM_SUSPEND calls */
+	uint32_t denied;	/* refused: another core was not off */
+	uint32_t denied_core;	/* the last core that was in the way */
+	uint32_t early;		/* WFI returned with the power on: nothing went down */
+	uint32_t resumed;	/* came back through the IRAM trampoline */
+	uint32_t in_progress;	/* set from the save to the end of the resume */
+	uint64_t cnt_suspend;	/* system counter as the suspend started */
+	uint64_t cnt_wake;	/* and as read at wake, before its restart */
+	uint32_t gicd_lines;	/* interrupt IDs the GICD save covers */
+	uint32_t gicd_ctlr;	/* saved GICD_CTLR */
+	uint32_t gicd_ctlr_wake; /* GICD_CTLR at wake, before the restore: 0 = it lost state */
+	uint32_t pub_acc_rdy;	/* PMU PUB_ACC_RDY at wake */
+	uint32_t intc_en_before[6]; /* AP INTC0-5 enables as mon_init found them */
+	/* at SYSTEM_SUSPEND entry, with every Linux driver suspended: the
+	 * clock enables and power states that decide whether AP_SYS and the
+	 * PUB may sleep (psci.c sys_snap_regs[] for the order) */
+	uint32_t snap[16];
+	/* AP INTC0-5 around the sleep: the enables armed for it (stock's wake
+	 * list cut to what Linux left enabled at the GIC), the masked status
+	 * (+0) right after arming, which is anything that will hold AP_SYS
+	 * awake, the raw status (+4) then, and the masked status at wake */
+	uint32_t intc_armed[6];
+	uint32_t intc_blocking[6];
+	uint32_t intc_raw[6];
+	uint32_t intc_wake[6];
+};
+
 void mon_enter_ns(uint64_t entry, uint64_t context) __attribute__((noreturn));
 void mon_flush_private_dcache(void);
+void mon_flush_dcache_all(void);
+extern const uint32_t mon_tramp[], mon_tramp_end[];
 #endif
 
 #endif /* CFW_MONITOR_H */
